@@ -94,19 +94,7 @@ lwm2m_object_t * objArray[OBJ_COUNT];
 # define BACKUP_OBJECT_COUNT 2
 lwm2m_object_t * backupObjectArray[BACKUP_OBJECT_COUNT];
 
-typedef struct
-{
-    lwm2m_object_t * securityObjP;
-    lwm2m_object_t * serverObject;
-    int sock;
-#ifdef WITH_TINYDTLS
-    dtls_connection_t * connList;
-    lwm2m_context_t * lwm2mH;
-#else
-    connection_t * connList;
-#endif
-    int addressFamily;
-} client_data_t;
+typedef app_data_t client_data_t;
 
 static void prv_quit(char * buffer,
                      void * user_data)
@@ -187,20 +175,18 @@ void * lwm2m_connect_server(uint16_t secObjInstID,
   lwm2m_list_t * instance;
   dtls_connection_t * newConnP = NULL;
   dataP = (client_data_t *)userData;
-  lwm2m_object_t  * securityObj = dataP->securityObjP;
 
   instance = LWM2M_LIST_FIND(dataP->securityObjP->instanceList, secObjInstID);
   if (instance == NULL) return NULL;
 
 
-  newConnP = connection_create(dataP->connList, dataP->sock, securityObj, instance->id, dataP->lwm2mH, dataP->addressFamily);
+  newConnP = connection_create(dataP, instance->id);
   if (newConnP == NULL)
   {
       fprintf(stderr, "Connection creation failed.\n");
       return NULL;
   }
 
-  dataP->connList = newConnP;
   return (void *)newConnP;
 }
 #else
@@ -1372,7 +1358,7 @@ int main(int argc, char *argv[])
         lwm2m_close(lwm2mH);
     }
     close(data.sock);
-    connection_free(data.connList);
+    connection_free(&data);
 
     clean_security_object(objArray[0]);
     lwm2m_free(objArray[0]);

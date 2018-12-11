@@ -43,27 +43,43 @@
 // after 40sec of inactivity we rehandshake
 #define DTLS_NAT_TIMEOUT 40
 
-typedef struct _dtls_connection_t
+typedef struct _app_data_t app_data_t;
+typedef struct _dtls_connection_t dtls_connection_t;
+
+struct _app_data_t
+{
+	// socket context
+    int sock;
+    int addressFamily;
+
+	// lwm2m context
+    lwm2m_object_t * securityObjP;
+    lwm2m_object_t * serverObject;
+    lwm2m_context_t * lwm2mH;
+
+    // dtls context
+    dtls_connection_t * connList;
+    dtls_context_t * dtlsContext;
+};
+
+struct _dtls_connection_t
 {
     struct _dtls_connection_t *  next;
-    int                     sock;
     struct sockaddr_in6     addr;
     size_t                  addrLen;
     session_t *      dtlsSession;
-    lwm2m_object_t * securityObj;
     int securityInstId;
-    lwm2m_context_t * lwm2mH;
-    dtls_context_t * dtlsContext;
     time_t lastSend; // last time a data was sent to the server (used for NAT timeouts)
-} dtls_connection_t;
+    app_data_t * appData;
+};
 
 int create_socket(const char * portStr, int ai_family);
 
 dtls_connection_t * connection_find(dtls_connection_t * connList, const struct sockaddr_storage * addr, size_t addrLen);
-dtls_connection_t * connection_new_incoming(dtls_connection_t * connList, int sock, const struct sockaddr * addr, size_t addrLen);
-dtls_connection_t * connection_create(dtls_connection_t * connList, int sock, lwm2m_object_t * securityObj, int instanceId, lwm2m_context_t * lwm2mH, int addressFamily);
+dtls_connection_t * connection_new_incoming(app_data_t * appData, const struct sockaddr * addr, size_t addrLen, bool secured);
+dtls_connection_t * connection_create(app_data_t * appData, int instanceId);
 
-void connection_free(dtls_connection_t * connList);
+void connection_free(app_data_t * appData);
 
 int connection_send(dtls_connection_t *connP, uint8_t * buffer, size_t length);
 int connection_handle_packet(dtls_connection_t *connP, uint8_t * buffer, size_t length);

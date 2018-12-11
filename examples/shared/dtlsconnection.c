@@ -26,8 +26,6 @@
 #define COAPS_PORT "5684"
 #define URI_LENGTH 256
 
-dtls_context_t * dtlsContext;
-
 /********************* Security Obj Helpers **********************/
 char * security_get_uri(lwm2m_object_t * obj, int instanceId, char * uriBuffer, int bufferSize){
     int size = 1;
@@ -156,7 +154,7 @@ int send_data(dtls_connection_t *connP,
     offset = 0;
     while (offset != length)
     {
-        nbSent = sendto(connP->sock, buffer + offset, length - offset, 0, (struct sockaddr *)&(connP->addr), connP->addrLen);
+        nbSent = sendto(connP->appData->sock, buffer + offset, length - offset, 0, (struct sockaddr *)&(connP->addr), connP->addrLen);
         if (nbSent == -1) return -1;
         offset += nbSent;
     }
@@ -176,7 +174,8 @@ static int get_psk_info(struct dtls_context_t *ctx,
         unsigned char *result, size_t result_length) {
 
     // find connection
-    dtls_connection_t* cnx = connection_find((dtls_connection_t *) ctx->app, &(session->addr.st),session->size);
+	app_data_t * appData = (app_data_t * )ctx->app;
+    dtls_connection_t* cnx = connection_find(appData->connList, &(session->addr.st),session->size);
     if (cnx == NULL)
     {
         printf("GET PSK session not found\n");
@@ -188,7 +187,7 @@ static int get_psk_info(struct dtls_context_t *ctx,
         {
             int idLen;
             char * id;
-            id = security_get_public_id(cnx->securityObj, cnx->securityInstId, &idLen);
+            id = security_get_public_id(appData->securityObjP, cnx->securityInstId, &idLen);
             if (result_length < idLen)
             {
                 printf("cannot set psk_identity -- buffer too small\n");
@@ -203,7 +202,7 @@ static int get_psk_info(struct dtls_context_t *ctx,
         {
             int keyLen;
             char * key;
-            key = security_get_secret_key(cnx->securityObj, cnx->securityInstId, &keyLen);
+            key = security_get_secret_key(appData->securityObjP, cnx->securityInstId, &keyLen);
 
             if (result_length < keyLen)
             {
@@ -234,8 +233,8 @@ static int send_to_peer(struct dtls_context_t *ctx,
         session_t *session, uint8 *data, size_t len) {
 
     // find connection
-    dtls_connection_t * connP = (dtls_connection_t *) ctx->app;
-    dtls_connection_t* cnx = connection_find((dtls_connection_t *) ctx->app, &(session->addr.st),session->size);
+    app_data_t * appData = (app_data_t *) ctx->app;
+    dtls_connection_t* cnx = connection_find(appData->connList, &(session->addr.st),session->size);
     if (cnx != NULL)
     {
         // send data to peer
@@ -255,11 +254,11 @@ static int read_from_peer(struct dtls_context_t *ctx,
           session_t *session, uint8 *data, size_t len) {
 
     // find connection
-    dtls_connection_t * connP = (dtls_connection_t *) ctx->app;
-    dtls_connection_t* cnx = connection_find((dtls_connection_t *) ctx->app, &(session->addr.st),session->size);
+    app_data_t * appData = (app_data_t *) ctx->app;
+    dtls_connection_t* cnx = connection_find(appData->connList, &(session->addr.st),session->size);
     if (cnx != NULL)
     {
-        lwm2m_handle_packet(cnx->lwm2mH, (uint8_t*)data, len, (void*)cnx);
+        lwm2m_handle_packet(cnx->appData->lwm2mH, (uint8_t*)data, len, (void*)cnx);
         return 0;
     }
     return -1;
@@ -279,17 +278,13 @@ static dtls_handler_t cb = {
 //#endif /* DTLS_ECC */
 };
 
-dtls_context_t * get_dtls_context(dtls_connection_t * connList) {
-    if (dtlsContext == NULL) {
-        dtls_init();
-        dtlsContext = dtls_new_context(connList);
-        if (dtlsContext == NULL)
-            fprintf(stderr, "Failed to create the DTLS context\r\n");
-        dtls_set_handler(dtlsContext, &cb);
-    }else{
-        dtlsContext->app = connList;
-    }
-    return dtlsContext;
+dtls_context_t * create_dtls_context(app_data_t * appData) {
+	dtls_init();
+	dtls_context_t * dtlsContext = dtls_new_context(appData);
+	if (dtlsContext == NULL)
+		fprintf(stderr, "Failed to create the DTLS context\r\n");
+	dtls_set_handler(dtlsContext, &cb);
+	return dtlsContext;
 }
 
 int get_port(struct sockaddr *x)
@@ -397,38 +392,49 @@ dtls_connection_t * connection_find(dtls_connection_t * connList,
     return connP;
 }
 
-dtls_connection_t * connection_new_incoming(dtls_connection_t * connList,
-                                       int sock,
+dtls_connection_t * connection_new_incoming(app_data_t * appData,
                                        const struct sockaddr * addr,
-                                       size_t addrLen)
+                                       size_t addrLen,
+									   bool secured)
 {
     dtls_connection_t * connP;
 
     connP = (dtls_connection_t *)malloc(sizeof(dtls_connection_t));
     if (connP != NULL)
     {
-        memset(connP, 0, sizeof(dtls_connection_t));
-        connP->sock = sock;
-        memcpy(&(connP->addr), addr, addrLen);
-        connP->addrLen = addrLen;
-        connP->next = connList;
+    	memset(connP, 0, sizeof(dtls_connection_t));
 
-        connP->dtlsSession = (session_t *)malloc(sizeof(session_t));
-        memset(connP->dtlsSession, 0, sizeof(session_t));
-        connP->dtlsSession->addr.sin6 = connP->addr;
-        connP->dtlsSession->size = connP->addrLen;
-        connP->lastSend = lwm2m_gettime();
-    }
+		// lazy loading of dtls context
+		if (appData->dtlsContext == NULL)
+		{
+			appData->dtlsContext = create_dtls_context(appData);
+		}
 
+		// add connection to the list
+		connP->next = appData->connList;
+		appData->connList = connP;
+
+		// set connection fields
+		connP->appData = appData;
+		memcpy(&(connP->addr), addr, addrLen);
+		connP->addrLen = addrLen;
+		// for secure connection set dtlsSession field.
+		if (secured){
+			connP->dtlsSession = (session_t *)malloc(sizeof(session_t));
+			memset(connP->dtlsSession, 0, sizeof(session_t));
+			connP->dtlsSession->addr.sin6 = connP->addr;
+			connP->dtlsSession->size = connP->addrLen;
+		}
+		else
+		{
+			connP->dtlsSession = NULL;
+		}
+		connP->lastSend = lwm2m_gettime();
+	}
     return connP;
 }
 
-dtls_connection_t * connection_create(dtls_connection_t * connList,
-                                 int sock,
-                                 lwm2m_object_t * securityObj,
-                                 int instanceId,
-                                 lwm2m_context_t * lwm2mH,
-                                 int addressFamily)
+dtls_connection_t * connection_create(app_data_t * appData, int instanceId)
 {
     struct addrinfo hints;
     struct addrinfo *servinfo = NULL;
@@ -443,10 +449,10 @@ dtls_connection_t * connection_create(dtls_connection_t * connList,
     char * port;
 
     memset(&hints, 0, sizeof(hints));
-    hints.ai_family = addressFamily;
+    hints.ai_family = appData->addressFamily;
     hints.ai_socktype = SOCK_DGRAM;
 
-    uri = security_get_uri(securityObj, instanceId, uriBuf, URI_LENGTH);
+    uri = security_get_uri(appData->securityObjP, instanceId, uriBuf, URI_LENGTH);
     if (uri == NULL) return NULL;
 
     // parse uri in the form "coaps://[host]:[port]"
@@ -510,26 +516,12 @@ dtls_connection_t * connection_create(dtls_connection_t * connList,
     }
     if (s >= 0)
     {
-        connP = connection_new_incoming(connList, sock, sa, sl);
+    	bool secured = (security_get_mode(appData->securityObjP, instanceId) != LWM2M_SECURITY_MODE_NONE);
+        connP = connection_new_incoming(appData, sa, sl, secured);
         close(s);
-
-        // do we need to start tinydtls?
         if (connP != NULL)
         {
-            connP->securityObj = securityObj;
             connP->securityInstId = instanceId;
-            connP->lwm2mH = lwm2mH;
-
-            if (security_get_mode(connP->securityObj,connP->securityInstId)
-                     != LWM2M_SECURITY_MODE_NONE)
-            {
-                connP->dtlsContext = get_dtls_context(connP);
-            }
-            else
-            {
-                // no dtls session
-                connP->dtlsSession = NULL;
-            }
         }
     }
 
@@ -538,18 +530,18 @@ dtls_connection_t * connection_create(dtls_connection_t * connList,
     return connP;
 }
 
-void connection_free(dtls_connection_t * connList)
+void connection_free(app_data_t * appData)
 {
-    dtls_free_context(dtlsContext);
-    dtlsContext = NULL;
-    while (connList != NULL)
+	dtls_free_context(appData->dtlsContext);
+	appData->dtlsContext = NULL;
+    while (appData->connList != NULL)
     {
         dtls_connection_t * nextP;
 
-        nextP = connList->next;
-        free(connList);
+        nextP = appData->connList->next;
+        free(appData->connList);
 
-        connList = nextP;
+        appData->connList = nextP;
     }
 }
 
@@ -569,7 +561,7 @@ int connection_send(dtls_connection_t *connP, uint8_t * buffer, size_t length){
                 return -1;
             }
         }
-        if (-1 == dtls_write(connP->dtlsContext, connP->dtlsSession, buffer, length)) {
+        if (-1 == dtls_write(connP->appData->dtlsContext, connP->dtlsSession, buffer, length)) {
             return -1;
         }
     }
@@ -582,14 +574,14 @@ int connection_handle_packet(dtls_connection_t *connP, uint8_t * buffer, size_t 
     if (connP->dtlsSession != NULL)
     {
         // Let liblwm2m respond to the query depending on the context
-        int result = dtls_handle_message(connP->dtlsContext, connP->dtlsSession, buffer, numBytes);
+        int result = dtls_handle_message(connP->appData->dtlsContext, connP->dtlsSession, buffer, numBytes);
         if (result !=0) {
              printf("error dtls handling message %d\n",result);
         }
         return result;
     } else {
         // no security, just give the plaintext buffer to liblwm2m
-        lwm2m_handle_packet(connP->lwm2mH, buffer, numBytes, (void*)connP);
+        lwm2m_handle_packet(connP->appData->lwm2mH, buffer, numBytes, (void*)connP);
         return 0;
     }
 }
@@ -602,18 +594,18 @@ int connection_rehandshake(dtls_connection_t *connP, bool sendCloseNotify) {
     }
 
     // reset current session
-    dtls_peer_t * peer = dtls_get_peer(connP->dtlsContext, connP->dtlsSession);
+    dtls_peer_t * peer = dtls_get_peer(connP->appData->dtlsContext, connP->dtlsSession);
     if (peer != NULL)
     {
         if (!sendCloseNotify)
         {
             peer->state =  DTLS_STATE_CLOSED;
         }
-        dtls_reset_peer(connP->dtlsContext, peer);
+        dtls_reset_peer(connP->appData->dtlsContext, peer);
     }
 
     // start a fresh handshake
-    int result = dtls_connect(connP->dtlsContext, connP->dtlsSession);
+    int result = dtls_connect(connP->appData->dtlsContext, connP->dtlsSession);
     if (result !=0) {
          printf("error dtls reconnection %d\n",result);
     }
