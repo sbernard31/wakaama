@@ -1292,6 +1292,13 @@ int main(int argc, char *argv[])
                     output_buffer(stderr, buffer, numBytes, 0);
 
                     connP = connection_find(data.connList, &addr, addrLen);
+#ifdef WITH_TINYDTLS
+                    if (connP == NULL) {
+                    	// create a new incoming connection
+                    	// we accept only secured incoming connection
+                    	connP = connection_new_incoming(&data, (struct sockaddr *)&addr, addrLen, true);
+                    }
+#endif
                     if (connP != NULL)
                     {
                         /*

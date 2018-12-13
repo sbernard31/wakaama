@@ -68,7 +68,7 @@ struct _dtls_connection_t
     struct sockaddr_in6     addr;
     size_t                  addrLen;
     session_t *      dtlsSession;
-    int securityInstId;
+    int securityInstId; // -1 value means that foreign peer of an incoming connection is not identified.
     time_t lastSend; // last time a data was sent to the server (used for NAT timeouts)
     app_data_t * appData;
 };

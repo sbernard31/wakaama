@@ -117,6 +117,35 @@ char * security_get_secret_key(lwm2m_object_t * obj, int instanceId, int * lengt
     }
 }
 
+bool security_server_hold_this_identity(lwm2m_object_t * objP, int instanceId,const char * pskid, size_t pskid_len )
+{
+	int64_t mode = security_get_mode(objP, instanceId);
+	if (mode == LWM2M_SECURITY_MODE_PRE_SHARED_KEY)
+	{
+		int idLen;
+		char * id;
+		id = security_get_public_id(objP, instanceId, &idLen);
+		if (idLen == pskid_len && strncmp(id, pskid, idLen) == 0)
+		{
+			return true;
+		}
+	}
+	return false;
+}
+
+uint16_t security_search_security_obj_by_pskid(lwm2m_object_t * objP, const char * pskid, size_t pskid_len)
+{
+	lwm2m_list_t * instanceP;
+	for (instanceP = objP->instanceList; instanceP != NULL ; instanceP = instanceP->next)
+	{
+		if (security_server_hold_this_identity(objP, instanceP->id,pskid, pskid_len ))
+		{
+			return instanceP->id;
+		}
+	}
+	return -1; // we didn't find any security object using this psk id
+}
+
 /********************* Security Obj Helpers Ends **********************/
 
 /* Returns the number sent, or -1 for errors */
@@ -185,6 +214,12 @@ static int get_psk_info(struct dtls_context_t *ctx,
     switch (type) {
         case DTLS_PSK_IDENTITY:
         {
+        	if (cnx->securityInstId < 0)
+        	{
+        		// This should not happened identity is asked only when we initiate the connection
+        		// and so we know to which we are talking about.
+        		return dtls_alert_fatal_create(DTLS_ALERT_INTERNAL_ERROR);
+        	}
             int idLen;
             char * id;
             id = security_get_public_id(appData->securityObjP, cnx->securityInstId, &idLen);
@@ -200,19 +235,41 @@ static int get_psk_info(struct dtls_context_t *ctx,
         }
         case DTLS_PSK_KEY:
         {
-            int keyLen;
-            char * key;
-            key = security_get_secret_key(appData->securityObjP, cnx->securityInstId, &keyLen);
+        	int keyLen;
+			char * key;
+			int securityInstId;
 
-            if (result_length < keyLen)
-            {
-                printf("cannot set psk -- buffer too small\n");
-                return dtls_alert_fatal_create(DTLS_ALERT_INTERNAL_ERROR);
+            if (cnx->securityInstId < 0){
+            	// We don't know security instance id,
+            	// that means we are establishing an incoming connection from an unknown peer.
+
+            	// We need to search a server which are using the given PSK identity.
+            	securityInstId = security_search_security_obj_by_pskid(appData->securityObjP, id, id_len);
+            	if (securityInstId == -1)
+            	{
+            		printf("Unknown psk id\n");
+            		return dtls_alert_fatal_create(DTLS_ALERT_INTERNAL_ERROR);
+            	}
             }
+            else
+            {
+            	// TODO what happened if IP of server is reused ? (multi server use-case ?)
+            	
+				// we already know the security instance id, so get the PSK key directly
+            	securityInstId = cnx->securityInstId;
+			}
 
-            memcpy(result, key,keyLen);
-            lwm2m_free(key);
-            return keyLen;
+        	key = security_get_secret_key(appData->securityObjP, securityInstId, &keyLen);
+
+            // write key in output paramters
+			if (result_length < keyLen)
+			{
+				printf("cannot set psk -- buffer too small\n");
+				return dtls_alert_fatal_create(DTLS_ALERT_INTERNAL_ERROR);
+			}
+			memcpy(result, key,keyLen);
+			lwm2m_free(key);
+			return keyLen;
         }
         case DTLS_PSK_HINT:
         {
@@ -251,14 +308,48 @@ static int send_to_peer(struct dtls_context_t *ctx,
 }
 
 static int read_from_peer(struct dtls_context_t *ctx,
-          session_t *session, uint8 *data, size_t len) {
+          session_t *session, dtls_handshake_parameters_t * identity, uint8 *data, size_t len) {
 
     // find connection
     app_data_t * appData = (app_data_t *) ctx->app;
     dtls_connection_t* cnx = connection_find(appData->connList, &(session->addr.st),session->size);
     if (cnx != NULL)
     {
-        lwm2m_handle_packet(cnx->appData->lwm2mH, (uint8_t*)data, len, (void*)cnx);
+    	// if this packet comes from a peer which was not identified (new incoming connection).
+    	if (cnx->securityInstId == -1)
+    	{
+    		// we support only psk
+    		if (identity->cipher != TLS_PSK_WITH_AES_128_CCM_8){
+    			// no psk : ignore it.
+    			return -1;
+    		}
+
+    		// Get psk identity on this peer
+    		dtls_handshake_parameters_psk_t * pskParam = (dtls_handshake_parameters_psk_t *) &identity->keyx;
+    		char * pskId = pskParam->identity;
+    		uint16_t psklen = pskParam->id_length;
+
+    		// then we need to search a server corresponding to this PSK id and associate the connection to this server.
+    		lwm2m_server_t * targetP;
+    		targetP = appData->lwm2mH->serverList;
+			while (targetP != NULL
+				&& !security_server_hold_this_identity(appData->securityObjP, targetP->secObjInstID, pskId, psklen))
+			{
+				targetP = targetP->next;
+			}
+			if (targetP != NULL)
+			{
+				// TODO remove and free old connection.
+				dtls_connection_t * oldConnP = targetP->sessionH;
+
+				// associate new connection to lwm2m server
+				cnx->securityInstId = targetP->secObjInstID;
+				targetP->sessionH = (void *) cnx;
+			}
+    	}
+
+    	// handle the lwm2m packet
+        lwm2m_handle_packet(appData->lwm2mH, (uint8_t*)data, len, (void*)cnx);
         return 0;
     }
     return -1;
@@ -429,6 +520,7 @@ dtls_connection_t * connection_new_incoming(app_data_t * appData,
 		{
 			connP->dtlsSession = NULL;
 		}
+		connP->securityInstId = -1; // means that foreign peer of an incoming connection is not identified
 		connP->lastSend = lwm2m_gettime();
 	}
     return connP;
